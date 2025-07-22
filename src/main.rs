@@ -4,123 +4,201 @@ use std::time::{Duration, Instant};
 
 use dotenv::dotenv;
 use itertools::Itertools;
-use serenity::all::{Cache, EventHandler};
+use serenity::all::EventHandler;
 use serenity::model::prelude::*;
 use serenity::{async_trait, prelude::*};
 
-#[derive(Clone, PartialEq, Eq)]
-struct Invite {
-    user: User,
-    server: GuildId,
-}
-
 struct PastMessages;
-struct AdminDMCache;
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct MessageInQueue {
-    user_id: UserId,
-    message: String,
-    channel: ChannelId,
-}
-
 impl TypeMapKey for PastMessages {
-    type Value = Arc<RwLock<VecDeque<(Instant, MessageInQueue)>>>;
-}
-impl TypeMapKey for AdminDMCache {
-    type Value = Arc<RwLock<Cache>>;
+    type Value = Arc<RwLock<VecDeque<(Instant, Message)>>>;
 }
 
 struct ROBot;
-// Time to keep messages in the cache
-const TIME_SPAN: u64 = 60;
+// Time in seconds to keep messages in the list
+const TIME_SPAN: u64 = 10;
 // Number of duplicate messages needed to ban
-const REPEAT_MESSAGES: usize = 10;
+const REPEAT_MESSAGES: usize = 3;
 
 #[async_trait]
 impl EventHandler for ROBot {
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot || msg.content.is_empty() {
-            return;
-        }
-        let past_messages = ctx
-            .data
-            .read()
-            .await
-            .get::<PastMessages>()
-            .expect("Expected list of past messages in TypeMap")
-            .clone();
+        check_for_duplicate_messages(&ctx, &msg).await;
+    }
+}
 
-        {
-            let mut q = past_messages.write().await;
+async fn check_for_duplicate_messages(ctx: &Context, new_message: &Message) {
+    // No need to process the message if the user is one of our bots
+    if new_message.author.bot {
+        return;
+    }
+    let past_messages = ctx
+        .data
+        .read()
+        .await
+        .get::<PastMessages>()
+        .expect("Expected list of past messages in TypeMap")
+        .clone();
 
-            // Remove old invites from the queue
-            loop {
-                if let Some(elem) = q.back() {
-                    if Instant::now().duration_since(elem.0) > Duration::from_secs(TIME_SPAN) {
-                        q.pop_back();
-                        continue;
-                    }
+    // block creates scope where past_messages is locked for writing
+    {
+        let mut q = past_messages.write().await;
+
+        // Remove old messages from the queue
+        loop {
+            if let Some(elem) = q.back() {
+                if Instant::now().duration_since(elem.0) > Duration::from_secs(TIME_SPAN) {
+                    q.pop_back();
+                    continue;
                 }
-
-                break;
             }
-            q.push_front((
-                Instant::now(),
-                MessageInQueue {
-                    user_id: msg.author.id,
-                    message: msg.content.clone(),
-                    channel: msg.channel_id,
-                },
-            ));
-            println!(
-                "Messages in queue:\n{}",
-                q.iter().map(|m| m.1.message.clone()).format("\n")
-            );
+
+            break;
         }
+        q.push_front((Instant::now(), new_message.clone()));
+        log::info!(
+            "Messages in queue:\n{}",
+            q.iter().map(|m| m.1.content.clone()).format("\n")
+        );
+    }
 
-        // We have now updated our queue, count identical invites
-        let same_user_count = past_messages
-            .read()
-            .await
-            .iter()
-            .filter(|a| a.1.user_id == msg.author.id && a.1.message == msg.content)
-            .unique()
-            .count();
+    // We have now updated our queue, count identical messages
+    let items = past_messages.read().await;
+    let same_user_messages: Vec<&(Instant, Message)> = items
+        .iter()
+        // This filter is intended to filter out messages that are the same as the new one. Currently not used...
+        //.filter(|message_in_queue| compare_messages(&message_in_queue.1, new_message))
+        // ===
+        // Filter out messages sent by the same user as the new message, in unique channels
+        .filter(|(_, message)| message.author.id == new_message.author.id)
+        .unique_by(|(_, message)| message.channel_id)
+        .collect();
+    let same_user_count = same_user_messages.len();
 
-        println!("count: {same_user_count}");
+    log::info!("count: {same_user_count}");
 
-        if same_user_count > REPEAT_MESSAGES {
-            ban_user(ctx, msg).await;
+    // TODO: > or >=?
+    if same_user_count > REPEAT_MESSAGES {
+        // TODO: change to conditionally enable actions below based on config
+        // ban_user(ctx, new_message).await;
+        //jail_user(ctx, &same_user_messages).await;
+        notify_me(ctx, &same_user_messages).await;
+    }
+}
+
+async fn jail_user(ctx: &Context, messages: &[&(Instant, Message)]) {
+    let guild_id = messages[0]
+        .1
+        .guild_id
+        .expect("Expected the message to be sent in a server");
+    let user_id = messages[0].1.author.id;
+    // Add user to group @muted
+    let role_id = RoleId::new(876090959589425152);
+    let audit_log_reason = Some(
+        "User was quarantiened for sending too many messages in a short time in different channels",
+    );
+    let res = ctx
+        .http
+        .add_member_role(guild_id, user_id, role_id, audit_log_reason)
+        .await;
+    if let Err(error) = res {
+        log::error!("Adding role to user failed: {error:?}");
+    }
+    // Delete the passed messages
+    for message in messages {
+        let channel_id = message.1.channel_id;
+        let message_id = message.1.id;
+        let res = ctx
+            .http
+            .delete_message(channel_id, message_id, audit_log_reason)
+            .await;
+        if let Err(error) = res {
+            log::error!("Deleting messages failed: {error:?}");
         }
     }
 }
 
-async fn ban_user(ctx: Context, msg: Message) {
+// TODO: This filter needs to be updated
+/// Returns true if messages are concidered to be identical for purposes of spam detection
+#[allow(unused)]
+fn compare_messages(msg1: &Message, msg2: &Message) -> bool {
+    // If the messages do not have the same author, they clearly cannot be identical
+    if msg1.author.id != msg2.author.id {
+        return false;
+    }
+
+    if msg1.content != msg2.content {
+        return false;
+    }
+
+    if !compare_attachments(msg1, msg2) {
+        return false;
+    }
+
+    // We have checked for all cases where the messages could be different. Return true as the messages are the same
+    true
+}
+
+/// Checks if the messages have identical attachments
+fn compare_attachments(msg1: &Message, msg2: &Message) -> bool {
+    // If the number of attachments do not match, the messages are not identical
+    if msg1.attachments.len() != msg2.attachments.len() {
+        return false;
+    }
+
+    // If neither message has attachments, they are identical. Handle edge case 0 here.
+    if msg1.attachments.len() == 0 {
+        return true;
+    }
+
+    let matches = msg1
+        .attachments
+        .iter()
+        .cartesian_product(msg2.attachments.iter())
+        .filter(|(_att1, _att2)| {
+            // TODO: Actually check if the attachments are the same
+            todo!()
+        })
+        .count();
+    return msg1.attachments.len() == matches;
+}
+
+#[allow(unused)]
+async fn ban_user(ctx: &Context, msg: &Message) {
     println!("Attempting to ban user");
     // ban user
     let res = ctx
                 .http
                 .ban_user(
-                    msg.guild_id.expect("Expected message to be sent on server"),
+                    msg.guild_id.expect("Expected offending message to be sent on server"),
                     msg.author.id,
+                    // TODO: Is this the best way, or should the offending messages be deleted in a more controlled way?
                     1,
                     Some(format!("RO-Bot Auto-Ban: Posted too many duplicate messages in a short time: {} identical messages in {}s", REPEAT_MESSAGES, TIME_SPAN).as_str()),
                 )
                 .await;
     if let Err(error) = res {
-        println!("Banning user failed: {error:?}");
+        log::error!("Banning user failed: {error:?}");
     }
 }
 
+// TODO: Something like this can be used, but instead post in specified channel (#bot-moderator)
 #[allow(unused)]
-async fn notify_me(ctx: Context) {
+async fn notify_me(ctx: &Context, messages: &[&(Instant, Message)]) {
     // Send a message to me directly
     let user_id = UserId::new(277536889165316096);
     let cache = &ctx.cache;
     let http = ctx.http();
     let channel = user_id.create_dm_channel((cache, http)).await.unwrap();
-    let res = channel.say(http, "Test").await;
+    //let res = channel.say(http, "I did a thing!").await;
+    let res = channel
+        .say(
+            http,
+            format!(
+                "User {} posted too quickly!",
+                messages[0].1.author.display_name()
+            ),
+        )
+        .await;
     match res {
         Ok(_) => (),
         Err(err) => println!("{err}"),
@@ -151,7 +229,6 @@ async fn main() {
         let mut data = client.data.write().await;
 
         data.insert::<PastMessages>(Arc::new(RwLock::new(VecDeque::new())));
-        data.insert::<AdminDMCache>(Arc::new(RwLock::new(Cache::new())));
     }
     if let Err(why) = client.start().await {
         println!("Client error: {why:?}");
