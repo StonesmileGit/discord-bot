@@ -13,11 +13,31 @@ impl EventHandler for ROBot {
     async fn message(&self, _ctx: Context, msg: Message) {
         log_msg(&msg);
     }
+    async fn message_update(
+        &self,
+        _ctx: Context,
+        _old_if_available: Option<Message>,
+        _new: Option<Message>,
+        event: MessageUpdateEvent,
+    ) {
+        log_msg_event(&event);
+    }
 }
 
 /// This function dumps the cache to a log file to allow for reading it later
 fn log_msg(message: &Message) {
     let msg = serde_json::to_string(message).expect("Serialising message failed!");
+    let path = "./dump.log";
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .expect("Failed to create or open logfile");
+    writeln!(file, "{msg}").expect("Failed to wirte to file!");
+}
+/// This function dumps the cache to a log file to allow for reading it later
+fn log_msg_event(event: &MessageUpdateEvent) {
+    let msg = serde_json::to_string(event).expect("Serialising message failed!");
     let path = "./dump.log";
     let mut file = OpenOptions::new()
         .append(true)
