@@ -67,9 +67,6 @@ async fn check_for_duplicate_messages(ctx: &Context, new_message: &Message) {
         .iter()
         // This filter is intended to filter out messages that are the same as the new one.
         .filter(|(_, message)| compare_messages(&message, new_message))
-        // ===
-        // Filter out messages sent by the same user as the new message, in unique channels
-        //.filter(|(_, message)| message.author.id == new_message.author.id)
         // Additionally filter by channels being unique, as the same message posted repeatedly
         // in the same channel is a different issue that we are not trying to address
         .unique_by(|(_, message)| message.channel_id)
@@ -130,9 +127,9 @@ fn compare_messages(msg1: &Message, msg2: &Message) -> bool {
         return false;
     }
 
-    if !compare_attachments(msg1, msg2) {
-        return false;
-    }
+    //if !compare_attachments(msg1, msg2) {
+    //    return false;
+    //}
 
     if !compare_embeds(msg1, msg2) {
         return false;
