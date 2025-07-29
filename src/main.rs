@@ -15,7 +15,7 @@ impl TypeMapKey for PastMessages {
 
 struct ROBot;
 // Time in seconds to keep messages in the list
-const TIME_SPAN: u64 = 10;
+const TIME_SPAN: u64 = 60;
 // Number of duplicate messages needed to ban
 const REPEAT_MESSAGES: usize = 3;
 
@@ -65,22 +65,23 @@ async fn check_for_duplicate_messages(ctx: &Context, new_message: &Message) {
     let items = past_messages.read().await;
     let same_user_messages: Vec<&(Instant, Message)> = items
         .iter()
-        // This filter is intended to filter out messages that are the same as the new one. Currently not used...
-        //.filter(|message_in_queue| compare_messages(&message_in_queue.1, new_message))
+        // This filter is intended to filter out messages that are the same as the new one.
+        .filter(|(_, message)| compare_messages(&message, new_message))
         // ===
         // Filter out messages sent by the same user as the new message, in unique channels
-        .filter(|(_, message)| message.author.id == new_message.author.id)
+        //.filter(|(_, message)| message.author.id == new_message.author.id)
+        // Additionally filter by channels being unique, as the same message posted repeatedly
+        // in the same channel is a different issue that we are not trying to address
         .unique_by(|(_, message)| message.channel_id)
         .collect();
     let same_user_count = same_user_messages.len();
 
     log::info!("count: {same_user_count}");
 
-    // TODO: > or >=?
-    if same_user_count > REPEAT_MESSAGES {
+    if same_user_count >= REPEAT_MESSAGES {
         // TODO: change to conditionally enable actions below based on config
         // ban_user(ctx, new_message).await;
-        //jail_user(ctx, &same_user_messages).await;
+        jail_user(ctx, &same_user_messages).await;
         notify_me(ctx, &same_user_messages).await;
     }
 }
@@ -117,7 +118,6 @@ async fn jail_user(ctx: &Context, messages: &[&(Instant, Message)]) {
     }
 }
 
-// TODO: This filter needs to be updated
 /// Returns true if messages are concidered to be identical for purposes of spam detection
 #[allow(unused)]
 fn compare_messages(msg1: &Message, msg2: &Message) -> bool {
@@ -134,7 +134,52 @@ fn compare_messages(msg1: &Message, msg2: &Message) -> bool {
         return false;
     }
 
+    if !compare_embeds(msg1, msg2) {
+        return false;
+    }
+
     // We have checked for all cases where the messages could be different. Return true as the messages are the same
+    true
+}
+
+fn compare_embeds(msg1: &Message, msg2: &Message) -> bool {
+    if msg1.embeds.len() != msg2.embeds.len() {
+        return false;
+    }
+
+    if msg1.embeds.len() == 0 {
+        return true;
+    }
+
+    'outer: for embed1 in &msg1.embeds {
+        for embed2 in &msg2.embeds {
+            if compare_embeds_inner(embed1, embed2) {
+                continue 'outer;
+            }
+        }
+        // Found no match for the embed, return false
+        return false;
+    }
+    // All embeds match
+    true
+}
+
+fn compare_embeds_inner(embed1: &Embed, embed2: &Embed) -> bool {
+    if embed1.title != embed2.title {
+        return false;
+    }
+    if embed1.description != embed2.description {
+        return false;
+    }
+
+    if embed1.kind != embed2.kind {
+        return false;
+    }
+
+    if embed1.url != embed2.url {
+        return false;
+    }
+
     true
 }
 
